@@ -1,0 +1,678 @@
+import { Controller, Get, Post, Patch, Put, Delete, Body, Param, Query, Headers, Res, HttpException, HttpStatus } from '@nestjs/common';
+import type { Response as ExpressResponse } from 'express';
+import { verifyJwt } from './jwt.util';
+
+// ─── Helper: garantiza que la URL de un microservicio siempre tenga protocolo ───
+// Railway a veces omite "https://" en las variables de entorno (solo el hostname).
+// La red privada de Railway (*.railway.internal) solo habla HTTP plano.
+function withProtocol(url: string | undefined, fallback: string): string {
+  const clean = url?.trim().replace(/\/+$/, '');
+  if (!clean) return fallback;
+  if (clean.startsWith('http')) return clean;
+  return clean.includes('.railway.internal') ? `http://${clean}` : `https://${clean}`;
+}
+
+// ─── Helper: reenvía el cuerpo y, si el microservicio falló, también su código HTTP ───
+// Sin esto, un 400 de validación del servicio llegaba al frontend como 201.
+async function propagate(res: Response): Promise<unknown> {
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new HttpException(data ?? { message: 'Error en el microservicio' }, res.status);
+  }
+  return data;
+}
+
+// ─── Helper: query string con sólo los filtros conocidos ───
+function qs(query: Record<string, string>): string {
+  const params = new URLSearchParams();
+  for (const key of ['user_id', 'role', 'unread']) {
+    if (typeof query?.[key] === 'string' && query[key]) params.set(key, query[key]);
+  }
+  const str = params.toString();
+  return str ? `?${str}` : '';
+}
+
+// ─── Helper: exige un JWT válido (y, opcionalmente, uno de los roles indicados) ───
+function requireUser(authHeader: string | undefined, roles?: string[]): Record<string, any> {
+  const token = authHeader?.replace(/^Bearer\s+/i, '');
+  if (!token) throw new HttpException('Autenticación requerida', HttpStatus.UNAUTHORIZED);
+  const payload = verifyJwt(token);
+  if (roles && !roles.includes(String(payload.role).toUpperCase())) {
+    throw new HttpException('No tienes permisos para esta acción', HttpStatus.FORBIDDEN);
+  }
+  return payload;
+}
+
+// ─── Helper: ¿puede el agente ver este contrato? (sólo los de visitas que tomó o que creó) ───
+async function agentCanSeeContract(userId: string, c: { agent_id?: string; lead_id?: string; property_id?: string }) {
+  if (c.agent_id === userId) return true;
+  try {
+    const res = await fetch(`${VIEWING_SVC}/viewings`);
+    const viewings = res.ok ? await res.json() : [];
+    return Array.isArray(viewings) && viewings.some((v: any) => v.agent_id === userId && v.lead_id === c.lead_id && v.property_id === c.property_id);
+  } catch {
+    return false;
+  }
+}
+
+// ─── URLs de microservicios (configurables via variables de entorno en Railway) ───
+const USER_SVC       = withProtocol(process.env.USER_SERVICE_URL,       'http://localhost:3001');
+const PROPERTY_SVC   = withProtocol(process.env.PROPERTY_SERVICE_URL,   'http://localhost:3003');
+const LEAD_SVC       = withProtocol(process.env.LEAD_SERVICE_URL,       'http://localhost:3004');
+const VIEWING_SVC    = withProtocol(process.env.VIEWING_SERVICE_URL,    'http://localhost:3005');
+const CONTRACT_SVC   = withProtocol(process.env.CONTRACT_SERVICE_URL,   'http://localhost:3006');
+const COMMISSION_SVC = withProtocol(process.env.COMMISSION_SERVICE_URL, 'http://localhost:3007');
+const NOTIFICATION_SVC = withProtocol(process.env.NOTIFICATION_SERVICE_URL, 'http://localhost:3009');
+const ANALYTICS_SVC  = withProtocol(process.env.ANALYTICS_SERVICE_URL,  'http://localhost:3010');
+
+@Controller()
+export class AppController {
+
+  // --- DIAGNÓSTICO: verifica que el gateway alcance a cada microservicio ---
+  @Get('health')
+  async health() {
+    const services: Record<string, string> = {
+      user: `${USER_SVC}/users`,
+      property: `${PROPERTY_SVC}/properties`,
+      lead: `${LEAD_SVC}/leads`,
+      viewing: `${VIEWING_SVC}/viewings`,
+      contract: `${CONTRACT_SVC}/contracts`,
+      commission: `${COMMISSION_SVC}/commissions`,
+      notification: `${NOTIFICATION_SVC}/notifications`,
+      analytics: `${ANALYTICS_SVC}/analytics`,
+    };
+
+    const entries = await Promise.all(
+      Object.entries(services).map(async ([name, url]) => {
+        let target: string;
+        try {
+          target = new URL(url).origin;
+        } catch {
+          return [name, { ok: false, error: 'URL inválida (revisa la variable)', target: url }] as const;
+        }
+        try {
+          const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+          return [name, { ok: res.ok, status: res.status, target }] as const;
+        } catch (error) {
+          const cause = (error as any)?.cause?.code ?? (error as Error).message;
+          return [name, { ok: false, error: cause, target }] as const;
+        }
+      }),
+    );
+
+    const result = Object.fromEntries(entries);
+    return { ok: entries.every(([, r]) => r.ok), services: result };
+  }
+
+  // --- RUTAS DE USUARIOS ---
+  @Get('users')
+  async getUsers() {
+    const res = await fetch(`${USER_SVC}/users`);
+    return res.json();
+  }
+
+  @Post('users')
+  async createUser(@Body() body: any) {
+    const res = await fetch(`${USER_SVC}/users`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return res.json();
+  }
+
+  // Solo un ADMIN autenticado puede activar/desactivar cuentas
+  @Patch('users/:id/status')
+  async setUserStatus(
+    @Param('id') id: string,
+    @Body() body: { active?: boolean },
+    @Headers('authorization') authHeader?: string,
+  ) {
+    const token = authHeader?.replace(/^Bearer\s+/i, '');
+    if (!token) throw new HttpException('Autenticación requerida', HttpStatus.UNAUTHORIZED);
+    const payload = verifyJwt(token);
+    if (String(payload.role).toUpperCase() !== 'ADMIN') {
+      throw new HttpException('Solo un administrador puede activar o desactivar cuentas', HttpStatus.FORBIDDEN);
+    }
+    if (payload.sub === id) {
+      throw new HttpException('No puedes desactivar tu propia cuenta', HttpStatus.BAD_REQUEST);
+    }
+    const res = await fetch(`${USER_SVC}/users/${id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: body?.active }),
+    });
+    return propagate(res);
+  }
+
+  @Post('login')
+  async login(@Body() body: any) {
+    try {
+      const res = await fetch(`${USER_SVC}/users/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Credenciales inválidas',
+          res.status || HttpStatus.UNAUTHORIZED,
+        );
+      }
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error de autenticación o de conexión con el servicio de usuarios',
+        HttpStatus.UNAUTHORIZED,
+      );
+    }
+  }
+
+  @Post('register')
+  async register(@Body() body: any) {
+    try {
+      const res = await fetch(`${USER_SVC}/users/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Error al registrar usuario',
+          res.status || HttpStatus.BAD_REQUEST,
+        );
+      }
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error de conexión con el servicio de usuarios para registro',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+  }
+
+  @Post('users/seed')
+  async seedUsers() {
+    try {
+      const res = await fetch(`${USER_SVC}/users/seed`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await res.json();
+      return data;
+    } catch (error) {
+      throw new HttpException(
+        'Error al conectar con user-service para ejecutar seed',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+  }
+
+  // --- RUTAS DE AUTENTICACIÓN Y SEGURIDAD JWT ---
+  @Post('auth/verify')
+  async verifyAuthToken(@Body() body: { token?: string }, @Headers('authorization') authHeader?: string) {
+    const token = body?.token || authHeader?.replace(/^Bearer\s+/i, '');
+    if (!token) {
+      throw new HttpException('Token no proporcionado en el cuerpo o encabezado Authorization', HttpStatus.BAD_REQUEST);
+    }
+    const payload = verifyJwt(token);
+    return {
+      valid: true,
+      user: payload,
+    };
+  }
+
+  @Get('auth/me')
+  async getAuthMe(@Headers('authorization') authHeader?: string) {
+    const token = authHeader?.replace(/^Bearer\s+/i, '');
+    if (!token) {
+      throw new HttpException('Encabezado Authorization: Bearer <token> requerido', HttpStatus.UNAUTHORIZED);
+    }
+    const payload = verifyJwt(token);
+    return payload;
+  }
+
+  // --- RUTAS DE PROPIEDADES ---
+  @Get('properties')
+  async getProperties() {
+    try {
+      const res = await fetch(`${PROPERTY_SVC}/properties`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  @Get('properties/:id')
+  async getPropertyById(@Param('id') id: string) {
+    try {
+      const res = await fetch(`${PROPERTY_SVC}/properties/${id}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Propiedad no encontrada',
+          res.status || HttpStatus.NOT_FOUND,
+        );
+      }
+
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error al obtener la propiedad del servicio',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Post('properties')
+  async createProperty(@Body() body: any, @Headers('authorization') authHeader?: string) {
+    requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${PROPERTY_SVC}/properties`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return propagate(res);
+  }
+
+  @Patch('properties/:id/status')
+  async updatePropertyStatus(@Param('id') id: string, @Body() body: any, @Headers('authorization') authHeader?: string) {
+    requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${PROPERTY_SVC}/properties/${id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return propagate(res);
+  }
+
+  @Patch('properties/:id')
+  async updateProperty(@Param('id') id: string, @Body() body: any, @Headers('authorization') authHeader?: string) {
+    requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${PROPERTY_SVC}/properties/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return propagate(res);
+  }
+
+  // --- RUTAS DE LEADS ---
+  @Get('leads')
+  async getLeads() {
+    try {
+      const res = await fetch(`${LEAD_SVC}/leads`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  @Post('leads')
+  async createLead(@Body() body: any) {
+    const res = await fetch(`${LEAD_SVC}/leads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return res.json();
+  }
+
+  // --- RUTAS DE VISITAS (VIEWINGS) ---
+  @Get('viewings')
+  async getViewings() {
+    try {
+      const res = await fetch(`${VIEWING_SVC}/viewings`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  @Post('viewings')
+  async createViewing(@Body() body: any) {
+    try {
+      const res = await fetch(`${VIEWING_SVC}/viewings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Error al agendar la visita',
+          res.status,
+        );
+      }
+
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error de conexión con el servicio de visitas',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Patch('viewings/:id/take')
+  async takeViewing(@Param('id') id: string, @Body() body: any) {
+    try {
+      const res = await fetch(`${VIEWING_SVC}/viewings/${id}/take`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Error al tomar la visita',
+          res.status,
+        );
+      }
+
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error de conexión con el servicio de visitas',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // --- RUTAS DE CONTRATOS (CONTRACTS) ---
+  @Get('contracts')
+  async getContracts(@Headers('authorization') authHeader?: string) {
+    try {
+      const res = await fetch(`${CONTRACT_SVC}/contracts`);
+      const contracts = await res.json();
+      // Con sesión de agente, sólo se devuelven los contratos de sus visitas
+      const token = authHeader?.replace(/^Bearer\s+/i, '');
+      if (token && Array.isArray(contracts)) {
+        const user = verifyJwt(token);
+        if (!['ADMIN', 'GERENTE'].includes(String(user.role).toUpperCase())) {
+          const keep = await Promise.all(contracts.map((c: any) => agentCanSeeContract(user.sub, c)));
+          return contracts.filter((_: any, i: number) => keep[i]);
+        }
+      }
+      return contracts;
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      return [];
+    }
+  }
+
+  @Patch('contracts/:id/status')
+  async updateContractStatus(@Param('id') id: string, @Body() body: any, @Headers('authorization') authHeader?: string) {
+    // Los agentes cierran contratos con la firma digital; cambiar el estado a mano es de gerencia
+    requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${CONTRACT_SVC}/contracts/${id}/status`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return propagate(res);
+  }
+
+  // --- FIRMA DIGITAL ---
+  // Estado de firmas + enlaces de firma (los tokens son secretos: exige sesión)
+  @Get('contracts/:id/signatures')
+  async getContractSignatures(@Param('id') id: string, @Headers('authorization') authHeader?: string) {
+    const user = requireUser(authHeader);
+    if (!['ADMIN', 'GERENTE'].includes(String(user.role).toUpperCase())) {
+      const cres = await fetch(`${CONTRACT_SVC}/contracts`);
+      const list = cres.ok ? await cres.json() : [];
+      const contract = Array.isArray(list) ? list.find((c: any) => c.id === id) : null;
+      if (!contract || !(await agentCanSeeContract(user.sub, contract))) {
+        throw new HttpException('Este contrato no pertenece a tus visitas', HttpStatus.FORBIDDEN);
+      }
+    }
+    const res = await fetch(`${CONTRACT_SVC}/contracts/${id}/signatures`);
+    return propagate(res);
+  }
+
+  @Get('contracts/:id/verify')
+  async verifyContractSignatures(@Param('id') id: string) {
+    const res = await fetch(`${CONTRACT_SVC}/contracts/${id}/verify`);
+    return propagate(res);
+  }
+
+  // Públicas: el token del enlace identifica al firmante
+  @Get('contracts/sign/:token')
+  async getSigningRequest(@Param('token') token: string) {
+    const res = await fetch(`${CONTRACT_SVC}/contracts/sign/${encodeURIComponent(token)}`);
+    return propagate(res);
+  }
+
+  @Post('contracts/sign/:token')
+  async submitSignature(
+    @Param('token') token: string,
+    @Body() body: any,
+    @Headers('x-forwarded-for') forwardedFor?: string,
+    @Headers('user-agent') userAgent?: string,
+  ) {
+    const res = await fetch(`${CONTRACT_SVC}/contracts/sign/${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(forwardedFor ? { 'x-forwarded-for': forwardedFor } : {}),
+        ...(userAgent ? { 'user-agent': userAgent } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    return propagate(res);
+  }
+
+  @Get('contracts/:id/pdf')
+  async getContractPdf(@Param('id') id: string, @Res() out: ExpressResponse) {
+    let res: Response;
+    try {
+      res = await fetch(`${CONTRACT_SVC}/contracts/${id}/pdf`);
+    } catch {
+      throw new HttpException('Error de conexión con el servicio de contratos', HttpStatus.BAD_GATEWAY);
+    }
+    if (!res.ok) {
+      const data = await res.json().catch(() => null);
+      throw new HttpException(data ?? { message: 'No se pudo generar el PDF' }, res.status);
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    out.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': res.headers.get('content-disposition') ?? 'attachment; filename="contrato.pdf"',
+      'Content-Length': String(buf.length),
+    });
+    out.end(buf);
+  }
+
+  @Post('contracts')
+  async createContract(@Body() body: any, @Headers('authorization') authHeader?: string) {
+    const user = requireUser(authHeader);
+    if (!['ADMIN', 'GERENTE'].includes(String(user.role).toUpperCase())) {
+      // Un agente sólo contrata sobre visitas que tomó, a su nombre y siempre como Pendiente (cierra con firma digital)
+      const ok = await agentCanSeeContract(user.sub, { lead_id: body?.lead_id, property_id: body?.property_id });
+      if (!ok) throw new HttpException('Sólo puedes crear contratos de las visitas que tomaste', HttpStatus.FORBIDDEN);
+      body = { ...body, agent_id: user.sub, status: 'Pendiente' };
+    }
+    try {
+      const res = await fetch(`${CONTRACT_SVC}/contracts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        throw new HttpException(
+          data.message || 'Error al procesar el contrato',
+          res.status,
+        );
+      }
+
+      return data;
+    } catch (error) {
+      if (error instanceof HttpException) {
+        throw error;
+      }
+      throw new HttpException(
+        'Error de conexión con el servicio de contratos',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // --- RUTAS DE COMISIONES (COMMISSIONS) ---
+  @Get('commissions')
+  async getCommissions() {
+    try {
+      const res = await fetch(`${COMMISSION_SVC}/commissions`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  @Get('commissions/agreements')
+  async getCommissionAgreements() {
+    try {
+      const res = await fetch(`${COMMISSION_SVC}/commissions/agreements`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  // Sólo gerencia/administración definen el acuerdo comercial vigente
+  @Post('commissions/agreements')
+  async createCommissionAgreement(@Body() body: any, @Headers('authorization') authHeader?: string) {
+    const user = requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${COMMISSION_SVC}/commissions/agreements`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, created_by: user.sub }),
+    });
+    return propagate(res);
+  }
+
+  // Comisión individual por agente: la fija sólo el administrador del sistema
+  @Get('commissions/agent-rules')
+  async getAgentRules(@Headers('authorization') authHeader?: string) {
+    requireUser(authHeader);
+    const res = await fetch(`${COMMISSION_SVC}/commissions/agent-rules`);
+    return propagate(res);
+  }
+
+  @Put('commissions/agent-rules')
+  async setAgentRule(@Body() body: any, @Headers('authorization') authHeader?: string) {
+    const user = requireUser(authHeader, ['ADMIN']);
+    const res = await fetch(`${COMMISSION_SVC}/commissions/agent-rules`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...body, updated_by: user.sub }),
+    });
+    return propagate(res);
+  }
+
+  @Delete('commissions/agent-rules/:id')
+  async deleteAgentRule(@Param('id') id: string, @Headers('authorization') authHeader?: string) {
+    requireUser(authHeader, ['ADMIN']);
+    const res = await fetch(`${COMMISSION_SVC}/commissions/agent-rules/${id}`, { method: 'DELETE' });
+    return propagate(res);
+  }
+
+  @Patch('commissions/:id/pay')
+  async payCommission(@Param('id') id: string, @Headers('authorization') authHeader?: string) {
+    requireUser(authHeader, ['ADMIN', 'GERENTE']);
+    const res = await fetch(`${COMMISSION_SVC}/commissions/${id}/pay`, { method: 'PATCH' });
+    return propagate(res);
+  }
+
+  @Get('offices')
+  async getOffices() {
+    try {
+      const res = await fetch(`${USER_SVC}/users/offices`);
+      return res.json();
+    } catch {
+      return [];
+    }
+  }
+
+  // --- RUTAS DE NOTIFICACIONES (NOTIFICATIONS) ---
+  // Filtros opcionales: ?user_id=&role=&unread=true
+  @Get('notifications')
+  async getNotifications(@Query() query: Record<string, string>) {
+    try {
+      const response = await fetch(`${NOTIFICATION_SVC}/notifications${qs(query)}`);
+      return response.json();
+    } catch {
+      return [];
+    }
+  }
+
+  @Get('notifications/unread-count')
+  async getUnreadCount(@Query() query: Record<string, string>) {
+    try {
+      const response = await fetch(`${NOTIFICATION_SVC}/notifications/unread-count${qs(query)}`);
+      return response.json();
+    } catch {
+      return { count: 0 };
+    }
+  }
+
+  @Patch('notifications/read-all')
+  async markAllNotificationsAsRead(@Query() query: Record<string, string>) {
+    try {
+      const response = await fetch(`${NOTIFICATION_SVC}/notifications/read-all${qs(query)}`, { method: 'PATCH' });
+      return response.json();
+    } catch {
+      throw new HttpException('Error al actualizar las notificaciones', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+  }
+
+  @Patch('notifications/:id/read')
+  async markNotificationAsRead(@Param('id') id: string) {
+    try {
+      const response = await fetch(`${NOTIFICATION_SVC}/notifications/${id}/read`, {
+        method: 'PATCH',
+      });
+      return response.json();
+    } catch (error) {
+      throw new HttpException(
+        'Error al actualizar la notificación',
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // --- RUTAS DE ANALÍTICAS (ANALYTICS) ---
+  @Get('analytics')
+  async getAnalytics() {
+    try {
+      const res = await fetch(`${ANALYTICS_SVC}/analytics`);
+      return res.json();
+    } catch {
+      return { total_revenue: 0, total_sales: 0, data_complete: false };
+    }
+  }
+}
